@@ -77,15 +77,11 @@ def get_duration(path):
     return float(r.stdout.strip())
 
 # ── 2. CONFIG ────────────────────────────────────────────────
-VIDEO_W    = 1080
-VIDEO_H    = 1920
-FPS        = 60          # ✨ 60fps for smooth animations
-BG_COLOR   = (10, 10, 10)
-ANIM_SECS  = 0.45        # entrance/exit duration
-ICON_Y     = 880         # main icon vertical center
-TEXT_Y     = 1200        # karaoke text Y position
-LUCIDE_CDN = "https://cdn.jsdelivr.net/npm/lucide-static@0.441.0/icons/{}.svg"
-FONT_PATH  = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+VIDEO_W    = 1920
+VIDEO_H    = 1080
+FPS        = 60
+BG_COLOR   = (255, 255, 255)   # White background — documentary style
+ANIM_SECS  = 0.35
 WORK_DIR   = "/tmp/motion_work"
 FRAMES_DIR = os.path.join(WORK_DIR, "frames")
 AUDIO_DIR  = os.path.join(WORK_DIR, "audio")
@@ -101,9 +97,6 @@ def ease_out_back(t):
     c1, c3 = 1.70158, 2.70158
     return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
 
-def ease_out_cubic(t):
-    return 1 - (1 - min(t, 1.0)) ** 3
-
 def ease_out_bounce(t):
     t = min(t, 1.0)
     if   t < 1/2.75:   return 7.5625*t*t
@@ -111,94 +104,74 @@ def ease_out_bounce(t):
     elif t < 2.5/2.75: t -= 2.25/2.75; return 7.5625*t*t+0.9375
     else:               t -= 2.625/2.75;return 7.5625*t*t+0.984375
 
-# ── 4. ANIMATION CALCULATOR ──────────────────────────────────
-def get_anim_state(t_local, duration, anim_type):
-    """
-    Returns (alpha, scale, line_progress)
-    - alpha:         0.0 to 1.0
-    - scale:         for icon scaling
-    - line_progress: 0.0 to 1.0 — how much of line is drawn
-    """
-    af = ANIM_SECS   # entrance duration
-    ef = ANIM_SECS   # exit duration
+# ── 4. ANIMATION STATE ───────────────────────────────────────
+def get_anim_state(t_local, duration):
+    af = ANIM_SECS
+    ef = ANIM_SECS
 
-    # ── Entrance ──────────────────────────
     if t_local < af:
-        t_in = t_local / af
-        if   anim_type == "fade_in":   alpha=ease_out_expo(t_in); scale=1.0
-        elif anim_type == "pop_in":    e=ease_out_back(t_in); alpha=ease_out_expo(t_in); scale=e
-        elif anim_type == "zoom_in":   e=ease_out_expo(t_in); alpha=e; scale=0.4+0.6*e
-        elif anim_type == "slide_up":  alpha=ease_out_expo(t_in); scale=1.0
-        elif anim_type == "bounce_in": alpha=min(t_in*3,1.0); scale=ease_out_bounce(t_in)
-        else:                          alpha=ease_out_expo(t_in); scale=1.0
-        line_progress = alpha
-
-    # ── Exit ──────────────────────────────
+        t_in  = t_local / af
+        alpha = ease_out_expo(t_in)
+        scale = ease_out_back(t_in)
+        scale = max(0.01, scale)
     elif t_local > duration - ef:
         t_out = (t_local - (duration - ef)) / ef
         t_out = min(t_out, 1.0)
         alpha = 1.0 - t_out
-        scale = 1.0 - 0.08 * t_out   # subtle shrink on exit
-        line_progress = alpha
-
-    # ── Idle: breathing ───────────────────
+        scale = 1.0 - 0.06 * t_out
     else:
         idle_t = t_local - af
         alpha  = 1.0
-        scale  = 1.0 + 0.012 * math.sin(idle_t * 1.8)  # ✨ breathing
-        line_progress = 1.0
+        scale  = 1.0 + 0.008 * math.sin(idle_t * 1.8)  # subtle breathing
 
-    return alpha, scale, line_progress
+    return alpha, scale
 
 # ── 5. FILM GRAIN ────────────────────────────────────────────
 def apply_grain(image):
-    """✨ Adds subtle organic texture to the frame."""
-    grain = Image.effect_noise((VIDEO_W, VIDEO_H), 12)
+    grain = Image.effect_noise((VIDEO_W, VIDEO_H), 8)
     grain = grain.convert("RGBA")
     base  = image.convert("RGBA")
-    try:
-        result = ImageChops.overlay(base, grain)
-    except AttributeError:
-        # Fallback for older Pillow: soft light blend manually
-        result = Image.blend(base, grain, 0.04)
+    result = Image.blend(base, grain, 0.03)
     return result.convert("RGB")
 
-# ── 6. ICON FETCH ────────────────────────────────────────────
-def hex_to_rgb(h):
-    h = h.lstrip("#"); return tuple(int(h[i:i+2],16) for i in (0,2,4))
-
-def fetch_icon(name, hex_color, size):
-    url = LUCIDE_CDN.format(name)
-    r   = requests.get(url, timeout=10)
+# ── 6. ASSET FETCH ───────────────────────────────────────────
+def fetch_asset(raw_url, width, height):
+    """GitHub raw_url se asset download karo — SVG ya PNG dono handle karta hai."""
+    r = requests.get(raw_url, timeout=15)
     if r.status_code != 200:
-        print(f"   ⚠️ '{name}' nahi mila, circle fallback")
-        r = requests.get(LUCIDE_CDN.format("circle"), timeout=10)
-    svg = r.text
-    svg = svg.replace('stroke="currentColor"', f'stroke="{hex_color}"')
-    svg = svg.replace('stroke-width="2"', 'stroke-width="2.5"')
-    svg = svg.replace('currentColor', hex_color)
-    png = cairosvg.svg2png(bytestring=svg.encode(), output_width=size, output_height=size)
-    return Image.open(io.BytesIO(png)).convert("RGBA")
+        raise Exception(f"❌ Asset nahi mila: {raw_url} [{r.status_code}]")
 
-# ── 7. DOWNLOAD JSON ─────────────────────────────────────────
-print("\n▶ Downloading Motion JSON...")
+    if raw_url.lower().endswith(".svg"):
+        png_data = cairosvg.svg2png(
+            bytestring=r.content,
+            output_width=width,
+            output_height=height
+        )
+        img = Image.open(io.BytesIO(png_data)).convert("RGBA")
+    else:
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        img = img.resize((width, height), Image.LANCZOS)
+
+    return img
+
+# ── 7. DOWNLOAD JSON FROM DRIVE ──────────────────────────────
+print("\n▶ Downloading Visual JSON...")
 mid   = get_folder_id("Motion_data", current_service=service)
 files = list_files(mid, current_service=service)
 jf    = next((f for f in files if f["name"].endswith(".json")), None)
 if not jf: raise FileNotFoundError("❌ .json nahi mila in Motion_data!")
 
-jp = os.path.join(WORK_DIR, "motion_data.json")
+jp = os.path.join(WORK_DIR, "visuals.json")
 os.makedirs(WORK_DIR, exist_ok=True)
 download_file(jf["id"], jp, current_service=service)
 print(f"   ✅ {jf['name']}")
 
-with open(jp) as f: raw = json.load(f)
-if isinstance(raw, list) and raw and "scenes" in raw[0]:
-    scenes = raw[0]["scenes"]
-else:
-    scenes = raw if isinstance(raw, list) else []
-scenes = sorted(scenes, key=lambda x: x["start_time"])
-print(f"   ✅ {len(scenes)} scenes loaded")
+with open(jp) as f:
+    raw = json.load(f)
+
+visuals = raw.get("visuals", [])
+visuals = sorted(visuals, key=lambda v: v["start"])
+print(f"   ✅ {len(visuals)} visuals loaded")
 
 # ── 8. DOWNLOAD AUDIO ────────────────────────────────────────
 print("\n▶ Downloading Audio...")
@@ -214,122 +187,63 @@ audio_dur    = get_duration(ap)
 total_frames = int(audio_dur * FPS)
 print(f"   ✅ {audio_dur:.2f}s | {total_frames} frames @ {FPS}fps")
 
-# ── 9. PRE-FETCH ICONS ───────────────────────────────────────
-print("\n▶ Pre-fetching icons...")
-icon_cache = {}
-for sc in scenes:
-    for el in sc.get("elements", []):
-        if el["type"] == "icon":
-            key = (el["name"], sc["highlight_color"], el.get("size", 240))
-            if key not in icon_cache:
-                print(f"   ⬇ {el['name']} sz={el.get('size',240)}")
-                icon_cache[key] = fetch_icon(el["name"], sc["highlight_color"], el.get("size",240))
-print("   ✅ Icons ready")
+# ── 9. PRE-CACHE ALL ASSETS ──────────────────────────────────
+print("\n▶ Pre-fetching assets from GitHub...")
+asset_cache = {}
+for vis in visuals:
+    key = vis["raw_url"]
+    if key not in asset_cache:
+        try:
+            print(f"   ⬇ {vis['asset_path'].split('/')[-1]}")
+            asset_cache[key] = fetch_asset(key, vis["width"], vis["height"])
+        except Exception as e:
+            print(f"   ⚠️ Skip: {e}")
+            asset_cache[key] = None
+print(f"   ✅ {len(asset_cache)} assets ready")
 
-# ── 10. FONT ─────────────────────────────────────────────────
-try:
-    font_main  = ImageFont.truetype(FONT_PATH, 56)
-    font_word  = ImageFont.truetype(FONT_PATH, 52)
-except Exception:
-    font_main = font_word = ImageFont.load_default()
+# ── 10. DRAW FRAME ───────────────────────────────────────────
+def draw_frame(frame_rgba, visuals, t):
+    # Active visuals at time t, sorted by z_index (low = bottom)
+    active = [v for v in visuals if v["start"] <= t < v["end"]]
+    active = sorted(active, key=lambda v: v["z_index"])
 
-# ── 11. DRAW SCENE ELEMENTS ──────────────────────────────────
-def draw_scene(frame_rgba, scene, t):
-    s_time = scene["start_time"]
-    dur    = scene["duration"]
-    t_local= t - s_time
+    overlay = Image.new("RGBA", (VIDEO_W, VIDEO_H), (0, 0, 0, 0))
 
-    alpha, scale, line_prog = get_anim_state(t_local, dur,
-                              scene.get("animation_in", "fade_in"))
-    if alpha <= 0.01:
-        return frame_rgba
+    for vis in active:
+        img = asset_cache.get(vis["raw_url"])
+        if img is None:
+            continue
 
-    color = scene.get("highlight_color", "#3B82F6")
-    rgb   = hex_to_rgb(color)
-    a255  = int(255 * alpha)
+        t_local  = t - vis["start"]
+        duration = vis["end"] - vis["start"]
+        alpha, scale = get_anim_state(t_local, duration)
 
-    overlay = Image.new("RGBA", (VIDEO_W, VIDEO_H), (0,0,0,0))
-    draw    = ImageDraw.Draw(overlay)
+        if alpha <= 0.01:
+            continue
 
-    for el in scene.get("elements", []):
+        # Scale karo
+        w = max(1, int(vis["width"]  * scale))
+        h = max(1, int(vis["height"] * scale))
 
-        # ── ✨ Animated Lines (grow from start to end) ──
-        if el["type"] == "line":
-            sx, sy = el["start_pos"]
-            ex, ey = el["end_pos"]
-            # Current endpoint grows with line_progress
-            curr_ex = sx + (ex - sx) * line_prog
-            curr_ey = sy + (ey - sy) * line_prog
-            draw.line([(sx, sy), (curr_ex, curr_ey)],
-                      fill=(*rgb, a255), width=el.get("thickness", 3))
+        if w != img.width or h != img.height:
+            img_scaled = img.resize((w, h), Image.LANCZOS)
+        else:
+            img_scaled = img
 
-        # ── Circles ──
-        elif el["type"] == "circle":
-            cx2, cy2 = el["x"], el["y"]
-            r = el.get("radius", 14) * scale
-            r = max(3, r)
-            # Circles appear only after line is 80% drawn
-            if line_prog >= 0.8:
-                circle_alpha = int(a255 * min((line_prog - 0.8) / 0.2, 1.0))
-                bb = [cx2-r, cy2-r, cx2+r, cy2+r]
-                if el.get("fill", True):
-                    draw.ellipse(bb, fill=(*rgb, circle_alpha))
-                else:
-                    draw.ellipse(bb, outline=(*rgb, circle_alpha), width=2)
+        # Scale hone pe center maintain karo
+        x = int(vis["x"] + (vis["width"]  - w) / 2)
+        y = int(vis["y"] + (vis["height"] - h) / 2)
 
-        # ── Icon (with scale + breathing) ──
-        elif el["type"] == "icon":
-            sz  = el.get("size", 240)
-            key = (el["name"], color, sz)
-            img = icon_cache.get(key)
-            if img is None: continue
+        # Alpha apply karo
+        r2, g2, b2, a2 = img_scaled.split()
+        a2 = a2.point(lambda p: int(p * alpha))
+        img_final = Image.merge("RGBA", (r2, g2, b2, a2))
 
-            scaled_sz = max(10, int(sz * scale))
-            if scaled_sz != sz:
-                img = img.resize((scaled_sz, scaled_sz), Image.LANCZOS)
-
-            ix = el["x"] - scaled_sz // 2
-            iy = el["y"] - scaled_sz // 2
-
-            r2,g2,b2,a2 = img.split()
-            a2 = a2.point(lambda p: int(p * alpha))
-            icon_final = Image.merge("RGBA",(r2,g2,b2,a2))
-            overlay.paste(icon_final, (int(ix), int(iy)), icon_final)
-
-    # ── ✨ Karaoke Text ──────────────────────────────────────
-    words = scene.get("words", [])
-    text  = scene.get("text", "").strip()
-
-    if words:
-        # Word-by-word highlight
-        dummy = ImageDraw.Draw(Image.new("RGBA",(1,1)))
-        all_text = " ".join(w["word"] for w in words)
-        total_w  = dummy.textbbox((0,0), all_text+" ", font=font_word)[2]
-        curr_x   = (VIDEO_W - total_w) // 2
-        ty       = TEXT_Y
-
-        for w in words:
-            w_str = w["word"] + " "
-            is_active = w["start"] <= t <= w["end"]
-            w_rgb = rgb if is_active else (160, 160, 160)
-            w_a   = 255 if is_active else int(180 * alpha)
-            draw.text((curr_x+2, ty+2), w_str, font=font_word, fill=(0,0,0,w_a))
-            draw.text((curr_x,   ty),   w_str, font=font_word, fill=(*w_rgb, w_a))
-            curr_x += dummy.textbbox((0,0), w_str, font=font_word)[2]
-
-    elif text:
-        # Static label below icon
-        dummy = ImageDraw.Draw(Image.new("RGBA",(1,1)))
-        bb = dummy.textbbox((0,0), text, font=font_main)
-        tw = bb[2]-bb[0]
-        tx = (VIDEO_W-tw)//2
-        ty = TEXT_Y
-        draw.text((tx+2, ty+2), text, font=font_main, fill=(0,0,0,a255))
-        draw.text((tx,   ty),   text, font=font_main, fill=(*rgb, a255))
+        overlay.paste(img_final, (x, y), img_final)
 
     return Image.alpha_composite(frame_rgba, overlay)
 
-# ── 12. FRAME LOOP ───────────────────────────────────────────
+# ── 11. FRAME LOOP ───────────────────────────────────────────
 print(f"\n▶ Rendering {total_frames} frames @ {FPS}fps...")
 bg = Image.new("RGB", (VIDEO_W, VIDEO_H), BG_COLOR)
 t0 = time.time()
@@ -337,26 +251,20 @@ t0 = time.time()
 for fi in range(total_frames):
     t     = fi / FPS
     frame = bg.copy().convert("RGBA")
-
-    for sc in scenes:
-        s = sc["start_time"]; e = s + sc["duration"]
-        if s <= t < e:
-            frame = draw_scene(frame, sc, t)
-
-    # ✨ Apply film grain to final composited frame
+    frame = draw_frame(frame, visuals, t)
     final = apply_grain(frame)
     final.save(os.path.join(FRAMES_DIR, f"frame_{fi:06d}.png"))
 
-    if fi % 180 == 0:  # every 3 seconds at 60fps
-        el  = time.time()-t0
-        eta = (el/max(fi,1))*(total_frames-fi)
+    if fi % 300 == 0:
+        el  = time.time() - t0
+        eta = (el / max(fi, 1)) * (total_frames - fi)
         print(f"   {fi}/{total_frames} | ETA: {eta:.0f}s")
 
 print(f"✅ Frames done in {time.time()-t0:.1f}s")
 
-# ── 13. ENCODE ───────────────────────────────────────────────
+# ── 12. ENCODE ───────────────────────────────────────────────
 print("\n▶ FFmpeg encode...")
-out = os.path.join(WORK_DIR, "motion_hook.mp4")
+out = os.path.join(WORK_DIR, "motion_video.mp4")
 res = subprocess.run(
     f'ffmpeg -y -r {FPS} -i "{FRAMES_DIR}/frame_%06d.png" -i "{ap}" '
     f'-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p '
@@ -364,14 +272,15 @@ res = subprocess.run(
     shell=True, capture_output=True, text=True
 )
 if res.returncode != 0:
-    print(res.stderr[-2000:]); raise RuntimeError("❌ FFmpeg fail!")
+    print(res.stderr[-2000:])
+    raise RuntimeError("❌ FFmpeg fail!")
 print("✅ Encoded!")
 
-# ── 14. UPLOAD ───────────────────────────────────────────────
+# ── 13. UPLOAD ───────────────────────────────────────────────
 print("\n▶ Re-authenticating before upload...")
 fs  = get_drive_service()
 vid = get_folder_id("Video", current_service=fs)
-upload_file(out, "motion_hook.mp4", vid, current_service=fs)
+upload_file(out, "motion_video.mp4", vid, current_service=fs)
 
 shutil.rmtree(WORK_DIR)
 print("🧹 Done!")
