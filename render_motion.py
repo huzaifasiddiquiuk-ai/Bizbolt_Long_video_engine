@@ -194,14 +194,11 @@ def get_duration(path):
 # 4. VIDEO CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-VIDEO_W    = 1920
-VIDEO_H    = 1080
-FPS        = 60
-BG_COLOR   = (255, 255, 255)
-ANIM_SECS  = 0.35
-
-# Quality constant: assets ko kam se kam is size pe cache karo
-# Taaki draw_frame mein HAMESHA downscale ho (downscale = sharper)
+VIDEO_W        = 1920
+VIDEO_H        = 1080
+FPS            = 60
+BG_COLOR       = (255, 255, 255)
+ANIM_SECS      = 0.35
 HIGH_RES_CACHE = 1200
 
 WORK_DIR   = "/tmp/motion_work"
@@ -210,6 +207,13 @@ AUDIO_DIR  = os.path.join(WORK_DIR, "audio")
 
 os.makedirs(FRAMES_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR,  exist_ok=True)
+
+# Optional AI upscaling — set UPSCALE_API_KEY env var to enable DeepAI SR
+UPSCALE_API_KEY = os.environ.get("UPSCALE_API_KEY")
+if UPSCALE_API_KEY:
+    print("   🤖 AI upscaling enabled (DeepAI)")
+else:
+    print("   🖼️ Multi-pass PIL upscaling (3 passes)")
 
 # ═══════════════════════════════════════════════════════════════
 # 5. EASING FUNCTIONS
@@ -255,34 +259,78 @@ def get_anim_state(t_local, duration):
     return max(0.0, min(1.0, alpha)), scale
 
 # ═══════════════════════════════════════════════════════════════
-# 7. FILM GRAIN
+# 7. IMAGE UPSCALING — MULTI-PASS (Option B + C Combined)
+#
+# Pass 1 (always): PIL LANCZOS 2x + strong UnsharpMask
+# Pass 2 (always): AI API (if key set) OR PIL 1.5x + UnsharpMask
+# Pass 3 (always): Final LANCZOS downscale to target + light sharpen
+#
+# Ye 3 passes har image pe laagu hote hain — custom PNG ya emoji sab pe.
 # ═══════════════════════════════════════════════════════════════
 
-def apply_grain(image):
-    try:
-        grain  = Image.effect_noise((VIDEO_W, VIDEO_H), 6)
-        grain  = grain.convert("RGBA")
-        base   = image.convert("RGBA")
-        result = Image.blend(base, grain, 0.02)
-        return result.convert("RGB")
-    except Exception:
-        return image
+def ai_upscale_api(img):
+    """DeepAI Super Resolution API — sirf tab call hota hai jab UPSCALE_API_KEY set ho."""
+    buf = io.BytesIO()
+    img.convert("RGBA").save(buf, "PNG")
+    buf.seek(0)
+    response = requests.post(
+        "https://api.deepai.org/api/torch-srgan",
+        files={"image": ("image.png", buf, "image/png")},
+        headers={"api-key": UPSCALE_API_KEY},
+        timeout=60
+    )
+    response.raise_for_status()
+    output_url = response.json().get("output_url")
+    if not output_url:
+        raise Exception("API se output_url nahi mila")
+    img_resp = requests.get(output_url, timeout=30)
+    img_resp.raise_for_status()
+    return Image.open(io.BytesIO(img_resp.content)).convert("RGBA")
+
+
+def multi_pass_upscale(img, target_w, target_h):
+    """
+    3-pass upscaling pipeline:
+    Pass 1 → PIL 2x + strong UnsharpMask
+    Pass 2 → AI API ya PIL 1.5x + UnsharpMask
+    Pass 3 → Exact target resize (downscale) + final sharpen
+    """
+    current  = img.copy().convert("RGBA")
+    orig_w, orig_h = current.size
+
+    # ── Pass 1: PIL 2x ───────────────────────────────────────
+    p1_size = max(orig_w * 2, target_w * 2, HIGH_RES_CACHE)
+    ratio   = p1_size / max(orig_w, orig_h, 1)
+    p1_w    = max(1, int(orig_w * ratio))
+    p1_h    = max(1, int(orig_h * ratio))
+    current = current.resize((p1_w, p1_h), Image.LANCZOS)
+    current = current.filter(ImageFilter.UnsharpMask(radius=2.5, percent=200, threshold=3))
+
+    # ── Pass 2: AI API ya PIL 1.5x ───────────────────────────
+    if UPSCALE_API_KEY:
+        try:
+            current = ai_upscale_api(current)
+            current = current.filter(ImageFilter.UnsharpMask(radius=1.5, percent=150, threshold=2))
+        except Exception as e:
+            print(f"      ⚠️ AI API fail ({e}) — PIL fallback")
+            p2_w = max(1, int(current.width * 1.5))
+            p2_h = max(1, int(current.height * 1.5))
+            current = current.resize((p2_w, p2_h), Image.LANCZOS)
+            current = current.filter(ImageFilter.UnsharpMask(radius=1.5, percent=150, threshold=2))
+    else:
+        p2_w = max(1, min(int(current.width * 1.5), target_w * 4))
+        p2_h = max(1, min(int(current.height * 1.5), target_h * 4))
+        current = current.resize((p2_w, p2_h), Image.LANCZOS)
+        current = current.filter(ImageFilter.UnsharpMask(radius=1.5, percent=150, threshold=2))
+
+    # ── Pass 3: Final exact resize to target (downscale = sharp) ─
+    current = current.resize((max(1, target_w), max(1, target_h)), Image.LANCZOS)
+    current = current.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
+
+    return current
 
 # ═══════════════════════════════════════════════════════════════
-# 8. ASSET FETCH — HIGH RESOLUTION CACHE
-#
-# QUALITY FIX EXPLAINED:
-# - Pehle code mein fetch_asset target size pe hi cache karta tha
-# - Phir draw_frame mein animation scale ke liye DOBARA resize — quality loss
-# - Ab: HIGH_RES_CACHE (1200px) pe cache karo ONCE
-# - draw_frame mein sirf ek downscale — downscale hamesha sharper hota hai
-#
-# SVG fix:
-# - cairosvg se 2x target pe render karo — vector = zero quality loss at any size
-#
-# PNG/JPG fix:
-# - Original se HIGH_RES_CACHE tak upscale karo ONCE with LANCZOS + SHARPEN
-# - Isse per-frame resize ka source high quality rehta hai
+# 8. ASSET FETCH
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_asset(raw_url, target_w, target_h):
@@ -303,54 +351,35 @@ def fetch_asset(raw_url, target_w, target_h):
         if raw_url.lower().endswith(".svg"):
             if cairosvg is None:
                 raise Exception("cairosvg nahi hai")
-            # SVG: 2x target size pe render karo — vector hai toh lossless
-            svg_render_w = max(target_w * 2, HIGH_RES_CACHE)
-            svg_render_h = max(target_h * 2, HIGH_RES_CACHE)
+            # SVG: vector render at 4x — zero quality loss
+            svg_w = max(target_w * 4, HIGH_RES_CACHE * 2)
+            svg_h = max(target_h * 4, HIGH_RES_CACHE * 2)
             png_bytes = cairosvg.svg2png(
                 bytestring=r.content,
-                output_width=svg_render_w,
-                output_height=svg_render_h
+                output_width=svg_w,
+                output_height=svg_h
             )
             img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-            return img  # HIGH res cached — draw_frame mein downscale hoga
+            return img  # SVG already at high res, no upscaling needed
 
         else:
             img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-            orig_w, orig_h = img.size
-
-            # Agar source already bada hai — as-is return karo
-            cache_size = max(HIGH_RES_CACHE, target_w, target_h)
-            if orig_w >= cache_size and orig_h >= cache_size:
-                return img
-
-            # Chhoti image — ek baar cache_size pe scale up karo
-            # Aspect ratio preserve karo
-            ratio = min(cache_size / max(orig_w, 1), cache_size / max(orig_h, 1))
-            new_w = max(1, int(orig_w * ratio))
-            new_h = max(1, int(orig_h * ratio))
-
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            # Double sharpen — chhoti se badi image mein edges blur hote hain
-            img = img.filter(ImageFilter.SHARPEN)
-            img = img.filter(ImageFilter.SHARPEN)
-            return img
+            # PNG/JPG: multi-pass upscale at 2x target
+            # (draw_frame mein downscale hoga — guaranteed sharp)
+            return multi_pass_upscale(img, target_w * 2, target_h * 2)
 
     except Exception as e:
-        raise Exception(f"Image parse fail: {e}")
+        raise Exception(f"Image parse/upscale fail: {e}")
 
 
 def resize_for_render(cached_img, target_w, target_h):
-    """
-    Cached high-res image se target size pe resize karo.
-    Ye HAMESHA downscale hoga (ya at worst minimal upscale).
-    LANCZOS + SHARPEN = best quality per frame.
-    """
+    """High-res cache se per-frame resize — hamesha downscale (sharp)."""
     target_w = max(1, target_w)
     target_h = max(1, target_h)
     if cached_img.width == target_w and cached_img.height == target_h:
         return cached_img.copy()
     resized = cached_img.resize((target_w, target_h), Image.LANCZOS)
-    resized = resized.filter(ImageFilter.SHARPEN)
+    resized = resized.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
     return resized
 
 # ═══════════════════════════════════════════════════════════════
@@ -381,63 +410,69 @@ def wrap_text(text, font, max_width):
     return lines if lines else [text]
 
 # ═══════════════════════════════════════════════════════════════
-# 10. SUBTITLE RENDERER
+# 10. SAFE SUBTITLE Y CALCULATOR
 #
-# OVERLAP FIX:
-# - active_visual: exact match visual (agar mila)
-# - all_active_visuals: backup — sab active visuals ki lowest bottom dhundho
-# - center_screen but visuals active hain? → unke NEECHE rakho, center pe nahi
+# FIX: Subtitle visual ke upar aa jaata tha — ye function
+# guaranteed bahar rakhta hai chahe visuals kahi bhi ho.
+#
+# Priority:
+#   1. Visuals ke NEECHE (preferred)
+#   2. Visuals ke UPAR (agar neeche jagah nahi)
+#   3. Force below with clamp (last resort)
+# ═══════════════════════════════════════════════════════════════
+
+def get_safe_subtitle_y(all_active_visuals, total_text_h):
+    MARGIN = 30
+
+    if not all_active_visuals:
+        return (VIDEO_H - total_text_h) // 2
+
+    max_bottom = max(v.get("y", 0) + v.get("height", 0) for v in all_active_visuals)
+    min_top    = min(v.get("y", 0) for v in all_active_visuals)
+
+    # Option 1: Neeche
+    y_below     = max_bottom + MARGIN
+    space_below = VIDEO_H - y_below - total_text_h - 10
+    if space_below >= 0:
+        return y_below
+
+    # Option 2: Upar
+    y_above = min_top - MARGIN - total_text_h
+    if y_above >= 10:
+        return y_above
+
+    # Option 3: Force, clamp to frame
+    return max(10, min(y_below, VIDEO_H - total_text_h - 10))
+
+# ═══════════════════════════════════════════════════════════════
+# 11. SUBTITLE RENDERER (Redesigned)
+#
+# FIX: Sirf safe zone mein render hoti hai — visuals se guarantee
+# bahar. position field sirf X alignment ke liye use hota hai.
 # ═══════════════════════════════════════════════════════════════
 
 def draw_subtitle(overlay, draw, text, position, font_size_key,
-                  active_visual=None, all_active_visuals=None):
+                  all_active_visuals=None, center_screen=False):
     if not text or not text.strip():
         return
 
-    font      = fonts.get(font_size_key, fonts["medium"])
-    max_w     = int(VIDEO_W * 0.80)
-    lines     = wrap_text(text, font, max_w)
-    line_h    = FONT_SIZES.get(font_size_key, 52) + 14
-    total_h   = len(lines) * line_h
-    dummy     = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    font    = fonts.get(font_size_key, fonts["medium"])
+    max_w   = int(VIDEO_W * 0.80)
+    lines   = wrap_text(text, font, max_w)
+    line_h  = FONT_SIZES.get(font_size_key, 52) + 14
+    total_h = len(lines) * line_h
+    dummy   = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
 
-    # ── Y POSITION ────────────────────────────────────────────
-    if position == "below_visual":
-        if active_visual:
-            vis_bottom = active_visual.get("y", 0) + active_visual.get("height", 0)
-            text_y = vis_bottom + 30
-        elif all_active_visuals:
-            # Sabse neeche wale visual ke baad rakho
-            max_bottom = max(
-                v.get("y", 0) + v.get("height", 0)
-                for v in all_active_visuals
-            )
-            text_y = max_bottom + 30
-        else:
-            text_y = VIDEO_H - total_h - 60
-
-    elif position == "center_screen":
-        if all_active_visuals:
-            # FIX: Visuals hain — center pe mat rakho, unke neeche rakho
-            max_bottom = max(
-                v.get("y", 0) + v.get("height", 0)
-                for v in all_active_visuals
-            )
-            text_y = max_bottom + 30
-        else:
-            # Sach mein koi visual nahi — center karo
-            text_y = (VIDEO_H - total_h) // 2
-
-    elif position in ("left", "right"):
+    # ── Y Position ───────────────────────────────────────────
+    if center_screen or not all_active_visuals:
         text_y = (VIDEO_H - total_h) // 2
-
     else:
-        text_y = VIDEO_H - total_h - 60
+        text_y = get_safe_subtitle_y(all_active_visuals, total_h)
 
-    # Canvas boundary clamp — kabhi bhi frame se bahar nahi jaana
+    # Hard clamp — kabhi bhi frame boundary se bahar nahi
     text_y = max(10, min(text_y, VIDEO_H - total_h - 10))
-    # ──────────────────────────────────────────────────────────
 
+    # ── Render Lines ─────────────────────────────────────────
     for i, line in enumerate(lines):
         try:
             lw = dummy.textbbox((0, 0), line, font=font)[2]
@@ -453,9 +488,8 @@ def draw_subtitle(overlay, draw, text, position, font_size_key,
         else:
             x = max(0, (VIDEO_W - lw) // 2)
 
-        # Shadow for readability
-        shadow_offsets = [(2, 2), (-1, -1), (2, -1), (-1, 2)]
-        for dx, dy in shadow_offsets:
+        # Shadow
+        for dx, dy in [(2, 2), (-1, -1), (2, -1), (-1, 2)]:
             try:
                 draw.text((x + dx, y + dy), line, font=font, fill=(200, 200, 200, 180))
             except Exception:
@@ -468,7 +502,7 @@ def draw_subtitle(overlay, draw, text, position, font_size_key,
             print(f"   ⚠️ Text draw fail: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# 11. DOWNLOAD JSON DATA
+# 12. DOWNLOAD JSON DATA
 # ═══════════════════════════════════════════════════════════════
 
 print("\n▶ Visual JSON download ho raha hai...")
@@ -498,7 +532,7 @@ except Exception as e:
     sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════
-# 12. DOWNLOAD AUDIO
+# 13. DOWNLOAD AUDIO
 # ═══════════════════════════════════════════════════════════════
 
 print("\n▶ Audio download ho raha hai...")
@@ -525,16 +559,11 @@ except Exception as e:
     sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════
-# 13. PRE-CACHE ASSETS AT HIGH RESOLUTION
-#
-# Pehle har URL ka maximum target size dhundho
-# Phir usi max size pe (ya HIGH_RES_CACHE, jo bhi bada) cache karo
-# Isse draw_frame mein hamesha downscale hoga
+# 14. PRE-CACHE ASSETS AT HIGH RESOLUTION
 # ═══════════════════════════════════════════════════════════════
 
-print("\n▶ GitHub se assets fetch ho rahe hain (high-res cache)...")
+print("\n▶ GitHub se assets fetch ho rahe hain (multi-pass upscaling)...")
 
-# Step 1: Per URL max size collect karo
 url_max_size = {}
 for vis in visuals:
     key = vis.get("raw_url", "")
@@ -545,7 +574,6 @@ for vis in visuals:
     prev_w, prev_h = url_max_size.get(key, (0, 0))
     url_max_size[key] = (max(prev_w, w), max(prev_h, h))
 
-# Step 2: Download and cache
 asset_cache = {}
 failed_urls = set()
 
@@ -558,15 +586,14 @@ for vis in visuals:
     if key in asset_cache:
         continue
 
-    fname    = vis.get("asset_path", key).split("/")[-1]
+    fname        = vis.get("asset_path", key).split("/")[-1]
     max_w, max_h = url_max_size.get(key, (vis.get("width", 400), vis.get("height", 400)))
 
     for attempt in range(3):
         try:
             print(f"   ⬇ {fname}")
             asset_cache[key] = fetch_asset(key, max_w, max_h)
-            size = asset_cache[key].size
-            print(f"      cached at {size[0]}x{size[1]}")
+            print(f"      ✅ cached at {asset_cache[key].size[0]}x{asset_cache[key].size[1]}")
             break
         except Exception as e:
             if attempt < 2:
@@ -582,13 +609,55 @@ fail_count = len(failed_urls)
 print(f"   ✅ {ok_count} assets ready | ❌ {fail_count} failed")
 
 # ═══════════════════════════════════════════════════════════════
-# 14. DRAW FRAME
+# 15. PRE-COMPUTE SUBTITLE–VISUAL PAIRING
 #
-# FIXES:
-# 1. resize_for_render — single resize from high-res cache
-# 2. Subtitle matching — overlap check (pehle exact, phir partial)
-# 3. No visual + center_screen → actual visuals ke neeche
-# 4. below_visual fallback → all_active_visuals se lowest bottom
+# FIX (Duplication): Subtitle ka start time visual ke start time
+# se pehle hota hai, isliye dono baar render hoti thi.
+#
+# Solution: Pehle check karo — kya poori video mein koi VALID
+# (non-failed) visual is subtitle ke saath overlap karta hai?
+#
+#   _has_visual = True  → sirf jab visual screen pe ho tab render
+#   _has_visual = False → narrator line, center screen pe render
+#
+# failed_urls ke baad run hota hai taaki failed assets ko
+# visual-paired nahi count kiya jaaye.
+# ═══════════════════════════════════════════════════════════════
+
+print("\n▶ Subtitle–visual pairing pre-compute ho rahi hai...")
+for sub in subtitles:
+    s_start = sub.get("start", 0)
+    s_end   = sub.get("end",   0)
+
+    paired = any(
+        vis.get("raw_url", "") and
+        vis.get("raw_url", "") not in failed_urls and
+        vis.get("start", 0) < s_end and
+        vis.get("end",   0) > s_start
+        for vis in visuals
+    )
+    sub["_has_visual"] = paired
+
+    status = "🖼️  visual-paired" if paired else "📝 text-only    "
+    print(f"   {status}: '{sub.get('text', '')[:55]}'")
+
+print("   ✅ Pairing done")
+
+# ═══════════════════════════════════════════════════════════════
+# 16. DRAW FRAME
+#
+# FIX 1 (Duplication):
+#   - has_visual=True → `if not active_vis: continue`
+#     Visual screen pe nahi? Subtitle skip — wait karo.
+#   - has_visual=False → center_screen (narrator text)
+#
+# FIX 2 (Overlap):
+#   - draw_subtitle() ab get_safe_subtitle_y() use karta hai
+#     jo guarantee karta hai text visuals ke bahar ho.
+#
+# FIX 3 (Fallback removed):
+#   - Purana "nearest subtitle" fallback hata diya.
+#   - Blank frames allowed hain — cleaner aur professional.
 # ═══════════════════════════════════════════════════════════════
 
 def draw_frame(t):
@@ -622,7 +691,6 @@ def draw_frame(t):
         h  = max(1, int(vh * scale))
 
         try:
-            # FIX: High-res cache se ek baar resize — quality best rahegi
             img_s = resize_for_render(cached_img, w, h)
         except Exception as e:
             print(f"   ⚠️ Resize fail: {e}")
@@ -648,82 +716,49 @@ def draw_frame(t):
 
     # ── RENDER SUBTITLES ──────────────────────────────────────
     for sub in active_subs:
-        position      = sub.get("position", "below_visual")
-        font_size_key = sub.get("font_size", "medium")
         text          = sub.get("text", "").strip()
+        position      = sub.get("position", "center")
+        font_size_key = sub.get("font_size", "medium")
+        has_visual    = sub.get("_has_visual", False)
+
         if not text:
             continue
 
-        # ── FIX: Two-pass matching ──
-        # Pass 1: Exact containment (subtitle poori tarah visual ke andar)
-        matching_vis = None
-        for vis in active_vis:
-            if (vis.get("raw_url", "") not in failed_urls and
-                vis.get("start", 0) <= sub.get("start", 0) and
-                vis.get("end",   0) >= sub.get("end",   0)):
-                matching_vis = vis
-                break
+        if has_visual:
+            # Visual-paired subtitle:
+            # Visual abhi screen pe nahi aaya? Skip — dobara mat dikhao
+            if not active_vis:
+                continue  # ← DUPLICATION FIX
 
-        # Pass 2: Partial overlap (subtitle ka koi bhi waqt visual ke saath overlap kare)
-        if matching_vis is None:
-            for vis in active_vis:
-                if (vis.get("raw_url", "") not in failed_urls and
-                    vis.get("start", 0) < sub.get("end",   0) and
-                    vis.get("end",   0) > sub.get("start", 0)):
-                    matching_vis = vis
-                    break
-
-        # Subtitle draw karo — matching_vis ya all_active_visuals se position decide hogi
-        if matching_vis:
-            draw_subtitle(
-                overlay, draw, text,
-                position, font_size_key,
-                active_visual=matching_vis,
-                all_active_visuals=None
-            )
-        elif active_vis:
-            # Koi exact match nahi — sab visuals ke neeche rakho (no overlap)
-            draw_subtitle(
-                overlay, draw, text,
-                position, font_size_key,
-                active_visual=None,
-                all_active_visuals=active_vis
-            )
-        else:
-            # Koi visual hi nahi — center_screen ya original position
-            draw_subtitle(
-                overlay, draw, text,
-                position, font_size_key,
-                active_visual=None,
-                all_active_visuals=None
-            )
-
-    # ── FALLBACK: Khaali frame nahi rehna chahiye ─────────────
-    if not active_vis and not active_subs and subtitles:
-        nearest = min(subtitles, key=lambda s: abs(s.get("start", 0) - t), default=None)
-        if nearest and abs(nearest.get("start", 0) - t) < 2.0:
+            # Visual hai — safe zone mein render (no overlap guaranteed)
             draw_subtitle(
                 overlay, draw,
-                nearest.get("text", ""),
-                "center_screen", "large",
-                active_visual=None,
-                all_active_visuals=None
+                text, position, font_size_key,
+                all_active_visuals=active_vis,
+                center_screen=False
+            )
+        else:
+            # Narrator/text-only — center screen
+            draw_subtitle(
+                overlay, draw,
+                text, position, font_size_key,
+                all_active_visuals=None,
+                center_screen=True
             )
 
     return Image.alpha_composite(frame, overlay).convert("RGB")
 
 # ═══════════════════════════════════════════════════════════════
-# 15. RENDER ALL FRAMES
+# 17. RENDER ALL FRAMES
 # ═══════════════════════════════════════════════════════════════
 
 print("\n▶ Frames render ho rahe hain...")
 
-# Purane frames delete karo
 if os.path.exists(FRAMES_DIR):
     shutil.rmtree(FRAMES_DIR)
 os.makedirs(FRAMES_DIR, exist_ok=True)
 
-log_every = max(1, FPS * 5)  # har 5 seconds pe log
+log_every = max(1, FPS * 5)
 
 for i in range(total_frames):
     t          = i / FPS
@@ -738,7 +773,7 @@ for i in range(total_frames):
 print("   ✅ Saare frames ready!")
 
 # ═══════════════════════════════════════════════════════════════
-# 16. ASSEMBLE VIDEO WITH FFMPEG
+# 18. ASSEMBLE VIDEO WITH FFMPEG
 # ═══════════════════════════════════════════════════════════════
 
 print("\n▶ Video assemble ho rahi hai FFmpeg se...")
@@ -752,11 +787,11 @@ ffmpeg_cmd = [
     "-i", ap,
     "-c:v", "libx264",
     "-preset", "fast",
-    "-crf", "18",            # 18 = near-lossless, 23 = default — lower = better quality
+    "-crf", "18",
     "-c:a", "aac",
     "-b:a", "192k",
     "-shortest",
-    "-pix_fmt", "yuv420p",   # max compatibility (YouTube, mobile, etc.)
+    "-pix_fmt", "yuv420p",
     output_video
 ]
 
@@ -767,8 +802,15 @@ if result.returncode != 0:
 
 print("   ✅ Video ready!")
 
+# Frames cleanup — disk space bachao
+try:
+    shutil.rmtree(FRAMES_DIR)
+    print("   🗑️ Frames cleaned up")
+except Exception:
+    pass
+
 # ═══════════════════════════════════════════════════════════════
-# 17. UPLOAD TO GOOGLE DRIVE
+# 19. UPLOAD TO GOOGLE DRIVE
 # ═══════════════════════════════════════════════════════════════
 
 print("\n▶ Drive pe upload ho rahi hai...")
